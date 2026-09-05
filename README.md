@@ -81,6 +81,24 @@ backend is configured (see [Storage backend](#storage-backend) below). Any
 format `ffmpeg` can decode is accepted (wav, mp3, m4a, flac, ogg, ...);
 everything is resampled to mono 16kHz internally.
 
+**Or send the audio inline**, with no upload step at all, via
+`audio_base64` (`audios_base64` for a batch):
+
+```json
+{
+  "input": {
+    "audio_base64": "UklGRi4AAABXQVZFZm10IBAAAAABAAEA..."
+  }
+}
+```
+
+Accepts a plain base64 string, a `data:audio/wav;base64,...` URI, or
+`{"data": "...", "name": "my-clip"}` to control the label used in the
+response and output filename (defaults to `inline-1`, `inline-2`, ...).
+`source`/`sources` and `audio_base64`/`audios_base64` can be mixed in one
+batch request. Inline audio is capped at 50MB decoded — for anything
+larger, upload it to the storage backend and use `source` instead.
+
 Optional fields (defaults shown):
 
 | field | default | notes |
@@ -181,6 +199,8 @@ subsequent runs reuse the cache.
 
 ## Testing a live endpoint
 
+With a file already on the storage backend:
+
 ```bash
 curl -s -X POST "https://api.runpod.ai/v2/<endpoint-id>/runsync" \
   -H "Authorization: Bearer <runpod-api-key>" \
@@ -188,5 +208,14 @@ curl -s -X POST "https://api.runpod.ai/v2/<endpoint-id>/runsync" \
   -d '{"input": {"source": "transcribe/input/clip.wav"}}' | python3 -m json.tool
 ```
 
-Note the input key is `source`/`sources` (an object key on your configured
-backend), not `prompt` — this worker isn't a text-generation endpoint.
+Or send a local file inline, no upload step needed:
+
+```bash
+curl -s -X POST "https://api.runpod.ai/v2/<endpoint-id>/runsync" \
+  -H "Authorization: Bearer <runpod-api-key>" \
+  -H "Content-Type: application/json" \
+  -d "{\"input\": {\"audio_base64\": \"$(base64 -i clip.wav)\"}}" | python3 -m json.tool
+```
+
+Note the input key is `source`/`sources`/`audio_base64`/`audios_base64`, not
+`prompt` — this worker isn't a text-generation endpoint.

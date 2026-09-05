@@ -48,8 +48,22 @@ single job can transcribe a batch:
   }
 }
 
+Audio can also be sent inline in the request instead of uploaded first,
+via "audio_base64" (or "audios_base64" for a batch) -- a plain base64
+string, a "data:audio/wav;base64,..." URI, or {"data": ..., "name": ...}
+for a custom output label:
+{
+  "input": {
+    "audio_base64": "UklGRi..."
+  }
+}
+"source"/"sources" and "audio_base64"/"audios_base64" can be mixed in one
+batch request.
+
 Unless "save_output" is false, a plain-text transcript is also written to
-"transcribe/output/<job-id>/<filename>.txt" on whichever backend is active.
+"transcribe/output/<job-id>/<filename>.txt" on whichever backend is active
+(this still happens for inline-audio items -- only the input audio skips
+storage, not the output transcript).
 
 Results are always returned in the "results" list, in the same order as the
 requested sources; sources that fail are reported in "failed" while the rest
@@ -58,6 +72,7 @@ of the batch still completes.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -338,51 +353,121 @@ def write_output(job_id: str, stem: str, text: str) -> str:
     return output_key
 
 
-def collect_source_keys(job_input: dict) -> list[str]:
-    """
-    Accept "source"/"sources" as either a single string or a list of strings
-    and normalise them into an ordered, de-duplicated list of keys.
-    """
-    raw_values = []
+MAX_INLINE_AUDIO_BYTES = 50 * 1024 * 1024  # 50MB decoded; these are short noisy clips, not long recordings
 
+
+def decode_base64_audio(value: str) -> bytes:
+    """Accept a plain base64 string or a data: URI and return raw bytes."""
+    if value.startswith("data:"):
+        _, _, value = value.partition(",")
+
+    try:
+        data = base64.b64decode(value, validate=True)
+    except Exception as exc:
+        raise ValueError(f"invalid base64 audio data: {exc}") from exc
+
+    if len(data) > MAX_INLINE_AUDIO_BYTES:
+        raise ValueError(
+            f"inline audio too large ({len(data)} bytes, max {MAX_INLINE_AUDIO_BYTES}); "
+            'upload it to the storage backend and use "source" instead'
+        )
+
+    return data
+
+
+def collect_items(job_input: dict) -> list[dict]:
+    """
+    Build an ordered list of work items from two independent input styles,
+    which can be mixed in one batch:
+
+    * "source"/"sources": object key(s) in the configured storage backend
+      (Network Volume or S3 bucket).
+    * "audio_base64"/"audios_base64": inline base64-encoded audio (a plain
+      base64 string, a data: URI, or {"data": ..., "name": ...} for a
+      custom label), needing no upload step at all.
+
+    Each item is {"source": <label used in the response/output filename>,
+    "kind": "key"|"inline", ...}.
+    """
+    items: list[dict] = []
+
+    raw_sources = []
     for field in ("source", "sources"):
         value = job_input.get(field)
-
         if value is None:
             continue
         if isinstance(value, str):
-            raw_values.append(value)
+            raw_sources.append(value)
         elif isinstance(value, (list, tuple)):
-            raw_values.extend(value)
+            raw_sources.extend(value)
         else:
             raise ValueError(f'"{field}" must be a string or a list of strings')
 
-    source_keys = []
-
-    for value in raw_values:
+    for value in raw_sources:
         if not isinstance(value, str) or not value.strip():
             raise ValueError("every source must be a non-empty string")
-
         key = value.strip()
-        if key not in source_keys:
-            source_keys.append(key)
+        items.append({"source": key, "kind": "key", "key": key})
 
-    if not source_keys:
+    raw_audios = []
+    for field in ("audio_base64", "audios_base64"):
+        value = job_input.get(field)
+        if value is None:
+            continue
+        if isinstance(value, (str, dict)):
+            raw_audios.append(value)
+        elif isinstance(value, (list, tuple)):
+            raw_audios.extend(value)
+        else:
+            raise ValueError(f'"{field}" must be a string, an object, or a list of those')
+
+    for index, value in enumerate(raw_audios, start=1):
+        if isinstance(value, str):
+            data_b64, name = value, None
+        elif isinstance(value, dict):
+            data_b64 = value.get("data")
+            name = value.get("name")
+            if not isinstance(data_b64, str) or not data_b64.strip():
+                raise ValueError(f'audio item {index}: missing required field "data" (base64 string)')
+        else:
+            raise ValueError(f'audio item {index} must be a base64 string or an object with a "data" field')
+
+        label = name.strip() if isinstance(name, str) and name.strip() else f"inline-{index}"
+        items.append({"source": label, "kind": "inline", "data_b64": data_b64})
+
+    if not items:
         raise ValueError(
-            'Missing required input field "source", for example '
-            '"transcribe/input/clip.wav" or ["transcribe/input/a.wav", '
-            '"transcribe/input/b.wav"]'
+            'Missing audio input: provide "source"/"sources" (object keys in the '
+            'storage backend) or "audio_base64"/"audios_base64" (inline base64-'
+            "encoded audio)"
         )
 
-    return source_keys
+    # De-dup labels defensively so batch outputs don't collide (e.g. the same
+    # key requested twice, or two inline items both named "clip.wav").
+    seen: dict[str, int] = {}
+    for item in items:
+        base_label = item["source"]
+        count = seen.get(base_label, 0)
+        seen[base_label] = count + 1
+        if count:
+            item["source"] = f"{base_label}-{count}"
+
+    return items
+
+
+def fetch_item_bytes(item: dict) -> bytes:
+    if item["kind"] == "inline":
+        return decode_base64_audio(item["data_b64"])
+    return fetch_audio_bytes(item["key"])
 
 
 # ---------------------------------------------------------------------------
 # Transcription
 # ---------------------------------------------------------------------------
 
-def transcribe_one(
-    source_key: str,
+def transcribe_bytes(
+    data: bytes,
+    label: str,
     model: WhisperModel,
     language: str | None,
     vad_filter: bool,
@@ -391,8 +476,7 @@ def transcribe_one(
     initial_prompt: str | None,
     include_segments: bool,
 ) -> dict:
-    data = fetch_audio_bytes(source_key)
-    audio, duration = decode_audio(data, label=source_key)
+    audio, duration = decode_audio(data, label=label)
 
     if apply_denoise:
         audio = denoise(audio)
@@ -428,7 +512,7 @@ def transcribe_one(
 def handler(job: dict) -> dict:
     job_input = job.get("input") or {}
 
-    source_keys = collect_source_keys(job_input)
+    items = collect_items(job_input)
 
     model_id = str(job_input.get("model", DEFAULT_MODEL))
     language = job_input.get("language", "en")
@@ -449,12 +533,16 @@ def handler(job: dict) -> dict:
     results: list[dict] = []
     failed: list[dict] = []
 
-    for index, source_key in enumerate(source_keys, start=1):
+    for index, item in enumerate(items, start=1):
+        source_label = item["source"]
         try:
-            print(f"[{index}/{len(source_keys)}] Transcribing {source_key} (model={model_id})", flush=True)
+            print(f"[{index}/{len(items)}] Transcribing {source_label} (model={model_id})", flush=True)
 
-            transcription = transcribe_one(
-                source_key=source_key,
+            data = fetch_item_bytes(item)
+
+            transcription = transcribe_bytes(
+                data=data,
+                label=source_label,
                 model=model,
                 language=language,
                 vad_filter=vad_filter,
@@ -466,16 +554,16 @@ def handler(job: dict) -> dict:
 
             output_key = None
             if save_output:
-                stem = Path(source_key).stem
+                stem = Path(source_label).stem or source_label
                 output_key = write_output(job_id, stem, transcription["text"])
 
         except Exception as exc:  # keep the rest of the batch going
-            print(f"Failed to transcribe {source_key}: {exc}", flush=True)
-            failed.append({"source": source_key, "error": str(exc)})
+            print(f"Failed to transcribe {source_label}: {exc}", flush=True)
+            failed.append({"source": source_label, "error": str(exc)})
             continue
 
         results.append({
-            "source": source_key,
+            "source": source_label,
             "output_key": output_key,
             "model": model_id,
             **transcription,
@@ -492,7 +580,7 @@ def handler(job: dict) -> dict:
     }
 
     # Keep a flat single-item response shape for the common single-source case.
-    if len(source_keys) == 1 and not failed:
+    if len(items) == 1 and not failed:
         response.update(results[0])
 
     return response
