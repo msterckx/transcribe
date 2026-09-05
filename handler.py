@@ -9,22 +9,27 @@ fine-tuned on the ATCO2 corpus of real air-traffic-control radio audio,
 which is dramatically more accurate on this domain. See README.md for the
 comparison against generic Whisper that justified this choice.
 
-Storage backend (pick one):
+Storage backend (auto-detected, in this priority order):
 
-* Network Volume mounted at /runpod-volume (default), or
-* S3-compatible bucket, e.g. a RunPod Network Volume accessed via its S3
-  API instead of a filesystem mount. Set:
+1. Network Volume mounted at /runpod-volume. If the endpoint has one
+   attached, RunPod mounts it automatically in every worker -- this is
+   plain local disk, no configuration needed, and is always preferred when
+   present since it's faster than going over the S3 API.
+2. S3-compatible bucket, used only when there is no local mount. Useful
+   when you deliberately don't attach a Network Volume, since attaching one
+   pins the endpoint to that volume's data center region and can limit
+   which GPUs are available. Set:
       RUNPOD_S3_BUCKET
       RUNPOD_S3_ENDPOINT
       RUNPOD_S3_ACCESS_KEY_ID
       RUNPOD_S3_SECRET_ACCESS_KEY
       RUNPOD_S3_REGION            (optional, defaults to "us-east-1")
-  When these are set, "source"/"sources" are object keys in that bucket
-  instead of paths under /runpod-volume, and outputs are written back to
-  the same bucket. This is the same shared volume/bucket already used by
-  the image-upscale and voicestudio workers on this account, so
-  "transcribe/..." key prefixes are used here to avoid colliding with
-  their "upscale/..." / "voice-studio/..." keys.
+
+Either way, "source"/"sources" are keys into whichever backend is active,
+and outputs are written back to the same one. This is the same shared
+volume/bucket already used by the image-upscale and voicestudio workers on
+this account, so "transcribe/..." key prefixes are used here to avoid
+colliding with their "upscale/..." / "voice-studio/..." keys.
 
 Input object example:
 {
@@ -77,7 +82,15 @@ S3_REGION = os.environ.get("RUNPOD_S3_REGION", "us-east-1")
 S3_ACCESS_KEY_ID = os.environ.get("RUNPOD_S3_ACCESS_KEY_ID")
 S3_SECRET_ACCESS_KEY = os.environ.get("RUNPOD_S3_SECRET_ACCESS_KEY")
 
-USE_S3 = bool(S3_BUCKET and S3_ENDPOINT and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)
+# A mounted Network Volume is local disk -- faster and simpler than the S3
+# API, and available in every worker automatically once attached to the
+# endpoint. Prefer it whenever it's actually present, even if RUNPOD_S3_*
+# vars are also set (e.g. left over from before a volume was attached).
+# S3 is only the active backend when there is no local mount to fall back to.
+USE_S3 = (
+    bool(S3_BUCKET and S3_ENDPOINT and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)
+    and not VOLUME_MOUNTED
+)
 
 _s3_client = None
 

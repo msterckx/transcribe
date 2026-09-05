@@ -118,17 +118,21 @@ still completes) — mirroring the batch shape used by `image-upscale`.
 
 ## Storage backend
 
-Two mutually exclusive backends are supported. Whichever is configured,
-`source`/`sources` are read from it and outputs are written back to it under
+Auto-detected, in this priority order. Whichever is active, `source`/
+`sources` are read from it and outputs are written back to it under
 `transcribe/...` key prefixes:
 
-**Network Volume mount** (the default; used by `image-upscale`/`voicestudio`) —
-attach a Network Volume to the endpoint, mounted at `/runpod-volume`. No
-extra configuration needed.
+**1. Network Volume mount** (preferred whenever present) — attach a Network
+Volume to the endpoint; RunPod mounts it at `/runpod-volume` in every worker
+automatically. This is plain local disk — no credentials, no configuration,
+and faster than the S3 API, so it's used whenever it's there, even if
+`RUNPOD_S3_*` vars are also set on the endpoint.
 
-**S3-compatible bucket** — used instead of a filesystem mount, e.g. a RunPod
-Network Volume accessed via its S3 API. Set these on the endpoint (RunPod
-Console → your endpoint → Environment Variables), not in `Dockerfile.txt`:
+**2. S3-compatible bucket** (fallback, only used when no volume is mounted) —
+for endpoints that deliberately skip attaching a Network Volume (attaching
+one pins the endpoint to that volume's data center region, which can limit
+GPU availability). Set these on the endpoint (RunPod Console → your endpoint
+→ Environment Variables), not in `Dockerfile.txt`:
 
 | variable | example |
 |---|---|
@@ -138,11 +142,12 @@ Console → your endpoint → Environment Variables), not in `Dockerfile.txt`:
 | `RUNPOD_S3_SECRET_ACCESS_KEY` | ditto |
 | `RUNPOD_S3_REGION` | e.g. `eu-ro-1` (optional, defaults to `us-east-1`) |
 
-When these four required variables are all present, S3 mode takes over
-entirely — the worker never touches `/runpod-volume` (and doesn't require it
-to exist). This account's `image-upscale` volume/bucket already has
-`upscale/...` keys in it; this worker only ever reads/writes under
-`transcribe/...`, so the two coexist safely in the same bucket.
+This account's `image-upscale` volume/bucket already has `upscale/...` keys
+in it; this worker only ever reads/writes under `transcribe/...`, so the two
+coexist safely in the same bucket whichever way it's accessed.
+
+If your endpoint has a Network Volume attached, you don't need the
+`RUNPOD_S3_*` variables at all — leave them unset.
 
 ## Local testing
 
