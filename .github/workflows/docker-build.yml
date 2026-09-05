@@ -1,0 +1,36 @@
+name: Build and push RunPod Docker images
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "Dockerfile.txt"
+      - "handler.py"
+      - ".dockerignore"
+      - ".github/workflows/docker-build.yml"
+
+jobs:
+  build-transcribe:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push transcribe image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.txt
+          push: true
+          tags: |
+            msterckx/transcribe-serverless:1.0
+            msterckx/transcribe-serverless:latest

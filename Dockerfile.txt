@@ -1,0 +1,79 @@
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+# v 1.0
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-dev \
+    python3-venv \
+    python3-pip \
+    build-essential \
+    curl \
+    ca-certificates \
+    git \
+    ffmpeg \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv "${VIRTUAL_ENV}" \
+    && pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# faster-whisper (CTranslate2 backend) does its own CUDA/cuDNN bundling via
+# pip, so it does not need the torch/torchvision stack used by the other
+# Runpod workers in this account.
+RUN pip install --no-cache-dir \
+    faster-whisper==1.2.1 \
+    huggingface_hub \
+    numpy \
+    scipy \
+    noisereduce \
+    runpod
+
+# ---------------------------------------------------------------------------
+# Bake the default model into the image so cold starts don't pay a download.
+#
+# Default: Whisper large-v3 fine-tuned on the ATCO2 corpus of real air
+# traffic control radio audio (jlvdoorn/whisper-large-v3-atco2-asr). Generic
+# Whisper hallucinates badly on this kind of very noisy narrowband radio
+# audio (wrong language, invented words); the ATC-tuned checkpoint is
+# dramatically more accurate on it. See README.md for the comparison that
+# justified this choice.
+#
+# This uses a community CTranslate2 conversion of that checkpoint. Some such
+# conversions omit preprocessor_config.json (large-v3 needs 128 mel bins,
+# and faster-whisper silently defaults to 80 without this file, which fails
+# at inference time with a shape-mismatch error) -- handler.py also patches
+# this defensively at load time for any model resolved this way, but we
+# write it here too so the baked-in model is correct out of the box.
+# ---------------------------------------------------------------------------
+RUN python3 -c "\
+from huggingface_hub import snapshot_download; \
+snapshot_download('kadirnar/whisper-large-v3-atco2-asr-ct2', local_dir='/app/models/atc-large-v3')"
+
+RUN cat > /app/models/atc-large-v3/preprocessor_config.json <<'EOF'
+{
+  "chunk_length": 30,
+  "feature_extractor_type": "WhisperFeatureExtractor",
+  "feature_size": 128,
+  "hop_length": 160,
+  "n_fft": 400,
+  "n_samples": 480000,
+  "nb_max_frames": 3000,
+  "padding_side": "right",
+  "padding_value": 0.0,
+  "processor_class": "WhisperProcessor",
+  "return_attention_mask": false,
+  "sampling_rate": 16000
+}
+EOF
+
+WORKDIR /app
+
+COPY handler.py /app/handler.py
+
+CMD ["python", "-u", "/app/handler.py"]
