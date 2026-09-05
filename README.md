@@ -76,9 +76,10 @@ Batch multiple files in one job with `sources`:
 }
 ```
 
-`source`/`sources` are keys relative to the Runpod Network Volume mounted at
-`/runpod-volume`. Any format `ffmpeg` can decode is accepted (wav, mp3, m4a,
-flac, ogg, ...); everything is resampled to mono 16kHz internally.
+`source`/`sources` are object keys, resolved against whichever storage
+backend is configured (see [Storage backend](#storage-backend) below). Any
+format `ffmpeg` can decode is accepted (wav, mp3, m4a, flac, ogg, ...);
+everything is resampled to mono 16kHz internally.
 
 Optional fields (defaults shown):
 
@@ -115,6 +116,34 @@ For a batch (`sources`) request, the same per-item objects come back in a
 (sources that errored, with the error message, while the rest of the batch
 still completes) — mirroring the batch shape used by `image-upscale`.
 
+## Storage backend
+
+Two mutually exclusive backends are supported. Whichever is configured,
+`source`/`sources` are read from it and outputs are written back to it under
+`transcribe/...` key prefixes:
+
+**Network Volume mount** (the default; used by `image-upscale`/`voicestudio`) —
+attach a Network Volume to the endpoint, mounted at `/runpod-volume`. No
+extra configuration needed.
+
+**S3-compatible bucket** — used instead of a filesystem mount, e.g. a RunPod
+Network Volume accessed via its S3 API. Set these on the endpoint (RunPod
+Console → your endpoint → Environment Variables), not in `Dockerfile.txt`:
+
+| variable | example |
+|---|---|
+| `RUNPOD_S3_BUCKET` | your Network Volume ID |
+| `RUNPOD_S3_ENDPOINT` | `https://s3api-<region>.runpod.io` |
+| `RUNPOD_S3_ACCESS_KEY_ID` | from RunPod Console → Settings → S3 API Keys |
+| `RUNPOD_S3_SECRET_ACCESS_KEY` | ditto |
+| `RUNPOD_S3_REGION` | e.g. `eu-ro-1` (optional, defaults to `us-east-1`) |
+
+When these four required variables are all present, S3 mode takes over
+entirely — the worker never touches `/runpod-volume` (and doesn't require it
+to exist). This account's `image-upscale` volume/bucket already has
+`upscale/...` keys in it; this worker only ever reads/writes under
+`transcribe/...`, so the two coexist safely in the same bucket.
+
 ## Local testing
 
 No GPU or Runpod account needed to sanity-check the pipeline against
@@ -137,8 +166,22 @@ subsequent runs reuse the cache.
 1. Add `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` secrets to this repo (same as
    `image-upscale`/`voicestudio`) so `.github/workflows/docker-build.yml` can
    push `msterckx/transcribe-serverless:latest`.
-2. In Runpod, create a Serverless Endpoint from that image, attach a Network
-   Volume, and upload input audio under `transcribe/input/` on the volume
-   (matching the `source`/`sources` keys you send in job input).
-3. GPU is recommended (`compute_type=float16`) but the handler falls back to
+2. In Runpod, create a Serverless Endpoint from that image, and either attach
+   a Network Volume, or set the `RUNPOD_S3_*` environment variables (see
+   [Storage backend](#storage-backend)) for S3 access instead.
+3. Upload input audio under `transcribe/input/` on whichever backend you
+   chose (matching the `source`/`sources` keys you send in job input).
+4. GPU is recommended (`compute_type=float16`) but the handler falls back to
    CPU automatically if CUDA isn't available (`FORCE_CPU=1` forces this).
+
+## Testing a live endpoint
+
+```bash
+curl -s -X POST "https://api.runpod.ai/v2/<endpoint-id>/runsync" \
+  -H "Authorization: Bearer <runpod-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"input": {"source": "transcribe/input/clip.wav"}}' | python3 -m json.tool
+```
+
+Note the input key is `source`/`sources` (an object key on your configured
+backend), not `prompt` — this worker isn't a text-generation endpoint.

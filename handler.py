@@ -9,8 +9,22 @@ fine-tuned on the ATCO2 corpus of real air-traffic-control radio audio,
 which is dramatically more accurate on this domain. See README.md for the
 comparison against generic Whisper that justified this choice.
 
-Expected Network Volume mount:
-    /runpod-volume
+Storage backend (pick one):
+
+* Network Volume mounted at /runpod-volume (default), or
+* S3-compatible bucket, e.g. a RunPod Network Volume accessed via its S3
+  API instead of a filesystem mount. Set:
+      RUNPOD_S3_BUCKET
+      RUNPOD_S3_ENDPOINT
+      RUNPOD_S3_ACCESS_KEY_ID
+      RUNPOD_S3_SECRET_ACCESS_KEY
+      RUNPOD_S3_REGION            (optional, defaults to "us-east-1")
+  When these are set, "source"/"sources" are object keys in that bucket
+  instead of paths under /runpod-volume, and outputs are written back to
+  the same bucket. This is the same shared volume/bucket already used by
+  the image-upscale and voicestudio workers on this account, so
+  "transcribe/..." key prefixes are used here to avoid colliding with
+  their "upscale/..." / "voice-studio/..." keys.
 
 Input object example:
 {
@@ -29,11 +43,8 @@ single job can transcribe a batch:
   }
 }
 
-The worker reads:
-    /runpod-volume/<source>
-
-and, unless "save_output" is false, writes a plain-text transcript to:
-    /runpod-volume/transcribe/output/<job-id>/<filename>.txt
+Unless "save_output" is false, a plain-text transcript is also written to
+"transcribe/output/<job-id>/<filename>.txt" on whichever backend is active.
 
 Results are always returned in the "results" list, in the same order as the
 requested sources; sources that fail are reported in "failed" while the rest
@@ -58,20 +69,45 @@ from faster_whisper import WhisperModel
 LOCAL_TEST = os.environ.get("LOCAL_TEST") == "1"
 
 VOLUME_ROOT = Path(os.environ.get("RUNPOD_VOLUME_ROOT", "/runpod-volume"))
-DATA_ROOT = VOLUME_ROOT / "transcribe"
-OUTPUT_DIR = DATA_ROOT / "output"
+VOLUME_MOUNTED = VOLUME_ROOT.is_dir()
 
-HF_HOME = DATA_ROOT / "cache" / "huggingface"
+S3_BUCKET = os.environ.get("RUNPOD_S3_BUCKET")
+S3_ENDPOINT = os.environ.get("RUNPOD_S3_ENDPOINT")
+S3_REGION = os.environ.get("RUNPOD_S3_REGION", "us-east-1")
+S3_ACCESS_KEY_ID = os.environ.get("RUNPOD_S3_ACCESS_KEY_ID")
+S3_SECRET_ACCESS_KEY = os.environ.get("RUNPOD_S3_SECRET_ACCESS_KEY")
 
-if LOCAL_TEST:
-    # /runpod-volume doesn't exist on a laptop; resolve sources relative to
-    # the current directory instead and leave the HF cache at its default
-    # location rather than trying to create it under a missing volume root.
-    pass
-else:
+USE_S3 = bool(S3_BUCKET and S3_ENDPOINT and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)
+
+_s3_client = None
+
+
+def get_s3_client():
+    global _s3_client
+    if _s3_client is None:
+        import boto3
+        from botocore.config import Config
+
+        _s3_client = boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT,
+            region_name=S3_REGION,
+            aws_access_key_id=S3_ACCESS_KEY_ID,
+            aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+            config=Config(signature_version="s3v4"),
+        )
+    return _s3_client
+
+
+# Only set up a persistent Hugging Face cache when there is somewhere
+# persistent to put it. /runpod-volume may not exist at all when the
+# worker is configured for S3-only access (no filesystem volume mount) --
+# unconditionally mkdir-ing under it would crash the worker on cold start.
+if not LOCAL_TEST and not USE_S3 and VOLUME_MOUNTED:
+    DATA_ROOT = VOLUME_ROOT / "transcribe"
+    HF_HOME = DATA_ROOT / "cache" / "huggingface"
     os.environ.setdefault("HF_HOME", str(HF_HOME))
     os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HF_HOME / "hub"))
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     (HF_HOME / "hub").mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -167,20 +203,22 @@ if os.environ.get("SKIP_PRELOAD") != "1":
 # Audio loading / preprocessing
 # ---------------------------------------------------------------------------
 
-def load_audio(path: Path) -> tuple[np.ndarray, float]:
+def decode_audio(data: bytes, label: str) -> tuple[np.ndarray, float]:
     """
-    Decode any ffmpeg-readable audio file to mono float32 PCM at 16kHz,
+    Decode any ffmpeg-readable audio bytes to mono float32 PCM at 16kHz,
     matching Whisper's expected input regardless of source format/rate.
+    Fed via stdin so it works identically whether the bytes came from local
+    disk or an S3 GetObject.
     """
     cmd = [
-        "ffmpeg", "-nostdin", "-threads", "0", "-i", str(path),
+        "ffmpeg", "-nostdin", "-threads", "0", "-i", "pipe:0",
         "-f", "f32le", "-ac", "1", "-ar", "16000",
         "-loglevel", "error", "-",
     ]
-    proc = subprocess.run(cmd, capture_output=True, check=False)
+    proc = subprocess.run(cmd, input=data, capture_output=True, check=False)
 
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed to decode {path.name}: {proc.stderr.decode(errors='replace')}")
+        raise RuntimeError(f"ffmpeg failed to decode {label}: {proc.stderr.decode(errors='replace')}")
 
     audio = np.frombuffer(proc.stdout, dtype=np.float32)
     duration = len(audio) / 16000.0
@@ -213,33 +251,78 @@ def denoise(audio: np.ndarray, sr: int = 16000) -> np.ndarray:
 # Input handling
 # ---------------------------------------------------------------------------
 
-def resolve_source(source_key: str) -> Path:
+def validate_key(source_key: str) -> str:
     """
-    Resolve a relative Network Volume key safely beneath /runpod-volume.
-    In LOCAL_TEST mode, resolve beneath the current directory instead, so
-    the handler can run directly against ./samples without a real volume.
+    Normalise and validate a source key. Used for both S3 object keys and
+    Network Volume relative paths, since the safety requirements are the
+    same either way: no escaping the bucket/volume, and a supported
+    audio extension.
     """
-    root = Path.cwd() if LOCAL_TEST else VOLUME_ROOT
+    key = source_key.strip().lstrip("/")
 
-    source_key = source_key.lstrip("/")
-    source_path = (root / source_key).resolve()
-    volume_root = root.resolve()
+    if not key or ".." in Path(key).parts:
+        raise ValueError(f"invalid source key: {source_key!r}")
+
+    suffix = Path(key).suffix.lower()
+    if suffix not in SUPPORTED_INPUT_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported source extension: {suffix}. "
+            f"Supported: {sorted(SUPPORTED_INPUT_EXTENSIONS)}"
+        )
+
+    return key
+
+
+def fetch_audio_bytes(source_key: str) -> bytes:
+    """
+    Read raw audio bytes for a source key from whichever backend is active:
+    the S3-compatible bucket if RUNPOD_S3_* is configured, otherwise the
+    Network Volume mount (or the current directory in LOCAL_TEST mode).
+    """
+    key = validate_key(source_key)
+
+    if USE_S3:
+        client = get_s3_client()
+        try:
+            obj = client.get_object(Bucket=S3_BUCKET, Key=key)
+        except Exception as exc:
+            error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+            if error_code in ("NoSuchKey", "404"):
+                raise FileNotFoundError(f"Source audio not found in bucket {S3_BUCKET}: {key}") from exc
+            raise
+        return obj["Body"].read()
+
+    root = Path.cwd() if LOCAL_TEST else VOLUME_ROOT
+    source_path = (root / key).resolve()
 
     try:
-        source_path.relative_to(volume_root)
+        source_path.relative_to(root.resolve())
     except ValueError as exc:
         raise ValueError("source must stay inside the Network Volume") from exc
 
     if not source_path.is_file():
         raise FileNotFoundError(f"Source audio not found: {source_path}")
 
-    if source_path.suffix.lower() not in SUPPORTED_INPUT_EXTENSIONS:
-        raise ValueError(
-            f"Unsupported source extension: {source_path.suffix}. "
-            f"Supported: {sorted(SUPPORTED_INPUT_EXTENSIONS)}"
-        )
+    return source_path.read_bytes()
 
-    return source_path
+
+def write_output(job_id: str, stem: str, text: str) -> str:
+    """
+    Write a plain-text transcript to whichever backend is active and return
+    its key.
+    """
+    output_key = f"transcribe/output/{job_id}/{stem}.txt"
+    body = (text + "\n").encode("utf-8")
+
+    if USE_S3:
+        get_s3_client().put_object(Bucket=S3_BUCKET, Key=output_key, Body=body)
+        return output_key
+
+    root = Path.cwd() if LOCAL_TEST else VOLUME_ROOT
+    output_path = root / output_key
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(body)
+    return output_key
 
 
 def collect_source_keys(job_input: dict) -> list[str]:
@@ -286,7 +369,7 @@ def collect_source_keys(job_input: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def transcribe_one(
-    source_path: Path,
+    source_key: str,
     model: WhisperModel,
     language: str | None,
     vad_filter: bool,
@@ -295,7 +378,8 @@ def transcribe_one(
     initial_prompt: str | None,
     include_segments: bool,
 ) -> dict:
-    audio, duration = load_audio(source_path)
+    data = fetch_audio_bytes(source_key)
+    audio, duration = decode_audio(data, label=source_key)
 
     if apply_denoise:
         audio = denoise(audio)
@@ -348,19 +432,16 @@ def handler(job: dict) -> dict:
     model = get_model(model_id)
 
     job_id = str(job.get("id") or "manual")
-    job_output_dir = OUTPUT_DIR / job_id
 
     results: list[dict] = []
     failed: list[dict] = []
 
     for index, source_key in enumerate(source_keys, start=1):
         try:
-            source_path = resolve_source(source_key)
-
-            print(f"[{index}/{len(source_keys)}] Transcribing {source_path} (model={model_id})", flush=True)
+            print(f"[{index}/{len(source_keys)}] Transcribing {source_key} (model={model_id})", flush=True)
 
             transcription = transcribe_one(
-                source_path=source_path,
+                source_key=source_key,
                 model=model,
                 language=language,
                 vad_filter=vad_filter,
@@ -372,10 +453,8 @@ def handler(job: dict) -> dict:
 
             output_key = None
             if save_output:
-                job_output_dir.mkdir(parents=True, exist_ok=True)
-                txt_path = job_output_dir / f"{source_path.stem}.txt"
-                txt_path.write_text(transcription["text"] + "\n")
-                output_key = txt_path.relative_to(VOLUME_ROOT).as_posix()
+                stem = Path(source_key).stem
+                output_key = write_output(job_id, stem, transcription["text"])
 
         except Exception as exc:  # keep the rest of the batch going
             print(f"Failed to transcribe {source_key}: {exc}", flush=True)
