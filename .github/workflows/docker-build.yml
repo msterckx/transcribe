@@ -25,6 +25,10 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Compute short commit SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push transcribe image
         uses: docker/build-push-action@v6
         with:
@@ -32,5 +36,6 @@ jobs:
           file: Dockerfile.txt
           push: true
           tags: |
-            msterckx/transcribe-serverless:1.0
+            msterckx/transcribe-serverless:1.1
+            msterckx/transcribe-serverless:${{ steps.vars.outputs.sha_short }}
             msterckx/transcribe-serverless:latest

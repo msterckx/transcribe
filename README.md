@@ -188,7 +188,12 @@ subsequent runs reuse the cache.
 
 1. Add `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` secrets to this repo (same as
    `image-upscale`/`voicestudio`) so `.github/workflows/docker-build.yml` can
-   push `msterckx/transcribe-serverless:latest`.
+   push `msterckx/transcribe-serverless`. Each build pushes three tags:
+   a version (`:1.1`), the commit SHA (`:<short-sha>`), and `:latest`. Point
+   the endpoint at the SHA tag if you want an exact, reproducible build
+   instead of `:latest` — RunPod doesn't always re-pull `:latest` on an
+   already-running worker, so a SHA tag is the reliable way to force a
+   specific version.
 2. In Runpod, create a Serverless Endpoint from that image, and either attach
    a Network Volume, or set the `RUNPOD_S3_*` environment variables (see
    [Storage backend](#storage-backend)) for S3 access instead.
